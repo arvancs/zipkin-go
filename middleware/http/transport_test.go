@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"io"
 	"io/ioutil"
@@ -123,5 +124,54 @@ func TestRoundTripErrResponseReadingSuccess(t *testing.T) {
 	actualBody, _ := ioutil.ReadAll(res.Body)
 	if want, have := expectedBody, actualBody; string(expectedBody) != string(actualBody) {
 		t.Errorf("unexpected body: want %s, have %s", want, have)
+	}
+}
+
+func TestTransportRequestSamplerOverridesSamplingFromContext(t *testing.T) {
+	cases := []struct {
+		Sampler          func(uint64) bool
+		RequestSampler   func(*http.Request) bool
+		ExpectedSampling string
+	}{
+		{
+			Sampler:          zipkin.AlwaysSample,
+			RequestSampler:   func(_ *http.Request) bool { return false },
+			ExpectedSampling: "0",
+		},
+		{
+			Sampler:          zipkin.NeverSample,
+			RequestSampler:   func(_ *http.Request) bool { return true },
+			ExpectedSampling: "1",
+		},
+	}
+
+	for _, c := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			if want, have := c.ExpectedSampling, r.Header.Get("x-b3-sampled"); want != have {
+				t.Errorf("unexpected sampling decision, want %q, have %q", want, have)
+			}
+		}))
+
+		tracer, err := zipkin.NewTracer(nil, zipkin.WithSampler(c.Sampler))
+		if err != nil {
+			t.Fatalf("unexpected error when creating tracer: %v", err)
+		}
+
+		sp := tracer.StartSpan("op1")
+		defer sp.Finish()
+		ctx := zipkin.NewContext(context.Background(), sp)
+
+		req, _ := http.NewRequest("GET", srv.URL, nil)
+		transport, _ := NewTransport(
+			tracer,
+			TransportRequestSampler(c.RequestSampler),
+		)
+
+		_, err = transport.RoundTrip(req.WithContext(ctx))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		srv.Close()
 	}
 }

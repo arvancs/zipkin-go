@@ -57,6 +57,7 @@ type transport struct {
 	errHandler        ErrHandler
 	errResponseReader *ErrResponseReader
 	logger            *log.Logger
+	requestSampler    func(r *http.Request) bool
 }
 
 // TransportOption allows one to configure optional transport configuration.
@@ -103,6 +104,15 @@ func TransportErrResponseReader(r ErrResponseReader) TransportOption {
 func TransportLogger(l *log.Logger) TransportOption {
 	return func(t *transport) {
 		t.logger = l
+	}
+}
+
+// TransportRequestSampler allows one to set the sampling decision based on
+// the details found in the http.Request. It has preference over the existing
+// sampling decision contained in the context.
+func TransportRequestSampler(sampleFunc func(r *http.Request) bool) TransportOption {
+	return func(t *transport) {
+		t.requestSampler = sampleFunc
 	}
 }
 
@@ -167,7 +177,13 @@ func (t *transport) RoundTrip(req *http.Request) (res *http.Response, err error)
 	zipkin.TagHTTPMethod.Set(sp, req.Method)
 	zipkin.TagHTTPPath.Set(sp, req.URL.Path)
 
-	_ = b3.InjectHTTP(req)(sp.Context())
+	spCtx := sp.Context()
+	if t.requestSampler != nil {
+		sample := t.requestSampler(req)
+		spCtx.Sampled = &sample
+	}
+
+	_ = b3.InjectHTTP(req)(spCtx)
 
 	res, err = t.rt.RoundTrip(req)
 	if err != nil {
